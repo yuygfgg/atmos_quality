@@ -5,7 +5,6 @@ Unified render and measurement CLI for DAMF, E-AC-3 JOC and TrueHD.
 ## Install
 
 ```sh
-cd /path/to/ddp_research
 python3 -m pip install -e .
 cp .env.example .env   # edit paths
 aq doctor
