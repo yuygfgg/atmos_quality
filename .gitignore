@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+cavern_render/bin/
+cavern_render/obj/
