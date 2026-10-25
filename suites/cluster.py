@@ -77,7 +77,9 @@ def run_cluster(
     try:
         if spatial_metrics:
             try:
-                spatial_pair = build_spatial_pair(source_asset, candidate_asset)
+                spatial_pair = build_spatial_pair(
+                    source_asset, candidate_asset, workdir=work / "spatial"
+                )
                 context = MetricContext(
                     spatial=spatial_pair,
                     workdir=work / "metadata",

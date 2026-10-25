@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 cavern_render/bin/
 cavern_render/obj/
+.env

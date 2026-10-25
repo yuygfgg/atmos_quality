@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +31,96 @@ class CavernBackend(RenderBackend):
         if not (CAVERN_SOURCE / "CavernRender.csproj").is_file():
             raise BackendUnavailable(f"Cavern source not found: {CAVERN_SOURCE}")
 
+    @staticmethod
+    def _bed_events(asset: Asset) -> tuple[dict[int, tuple[float, float, float]], dict]:
+        """Find static bed channels Cavern drops when they have no position event."""
+        if asset.kind != "damf":
+            return {}, {}
+        try:
+            from atmos_cluster.config import BED_POSITIONS
+            from atmos_cluster.damf.manifest import first_presentation, load_manifest
+            from atmos_cluster.damf.metadata import load_events
+        except ImportError:
+            return {}, {}
+
+        manifest = load_manifest(asset.path)
+        presentation = first_presentation(manifest)
+        metadata_path = asset.path.parent / presentation["metadata"]
+        _, events = load_events(metadata_path)
+        positioned = {
+            int(event["ID"])
+            for event in events
+            if event.get("ID") is not None and event.get("pos") is not None
+        }
+        missing: dict[int, tuple[float, float, float]] = {}
+        for bed in presentation.get("bedInstances") or []:
+            for channel in bed.get("channels") or []:
+                name = str(channel.get("channel", "")).upper()
+                if name == "LFE":
+                    continue
+                position = BED_POSITIONS.get(name)
+                if position is None:
+                    continue
+                channel_id = int(channel.get("ID"))
+                if channel_id not in positioned:
+                    missing[channel_id] = (
+                        float(position[0]),
+                        float(position[1]),
+                        float(position[2]),
+                    )
+        return missing, presentation
+
+    @staticmethod
+    @contextmanager
+    def _render_input(
+        asset: Asset,
+        bed_events: dict[int, tuple[float, float, float]],
+        presentation: dict,
+    ):
+        if not bed_events:
+            yield asset.path
+            return
+
+        with tempfile.TemporaryDirectory(prefix="aq_damf_bedfix_") as directory:
+            root = Path(directory)
+            manifest = root / "render.atmos"
+            metadata = root / "render.atmos.metadata"
+            audio = root / "render.atmos.audio"
+            metadata_name = presentation["metadata"]
+            audio_name = presentation["audio"]
+            manifest.write_text(
+                asset.path.read_text()
+                .replace(metadata_name, metadata.name)
+                .replace(audio_name, audio.name)
+            )
+
+            source_metadata = asset.path.parent / metadata_name
+            lines = source_metadata.read_text().splitlines()
+            index = lines.index("events:") + 1
+            block: list[str] = []
+            for channel_id, position in sorted(bed_events.items()):
+                block.extend(
+                    [
+                        f"  - ID: {channel_id}",
+                        "    samplePos: 0",
+                        "    active: true",
+                        f"    pos: [{position[0]}, {position[1]}, {position[2]}]",
+                        "    gain: 0",
+                        "    rampLength: 0",
+                        "    trimBypass: false",
+                        "    headTrackMode: undefined",
+                        "    binauralRenderMode: off",
+                    ]
+                )
+            metadata.write_text("\n".join(lines[:index] + block + lines[index:]) + "\n")
+
+            source_audio = (asset.path.parent / audio_name).resolve()
+            try:
+                audio.symlink_to(source_audio)
+            except OSError:
+                shutil.copyfile(source_audio, audio)
+            yield manifest
+
     def render(
         self,
         asset: Asset,
@@ -41,7 +133,9 @@ class CavernBackend(RenderBackend):
         if not self.supports(asset, layout):
             raise ValueError(f"{self.name} does not support {asset.kind} -> {layout.name}")
 
-        key = cache.render_key(self.name, self.version, asset, layout, options)
+        bed_events, presentation = self._bed_events(asset)
+        version = self.version + ("+bedevents" if bed_events else "")
+        key = cache.render_key(self.name, version, asset, layout, options)
         output = cache.path("renders/cavern", key, ".f32")
         meta_path = output.with_suffix(".json")
         if not force and output.is_file() and meta_path.is_file():
@@ -55,19 +149,20 @@ class CavernBackend(RenderBackend):
         sidecar = Path(str(temporary) + ".json")
         sidecar.unlink(missing_ok=True)
 
-        command = [
-            *prefix,
-            str(asset.path),
-            str(temporary),
-            layout.cavern_spec or layout.name,
-            "--raw",
-        ]
-        if options.max_seconds > 0.0:
-            command += ["--max-seconds", f"{options.max_seconds:.6f}"]
-        if options.gain_db:
-            command += ["--gain-db", f"{options.gain_db:.6f}"]
-        command += ["--update-rate", str(options.update_rate)]
-        run_command(command, timeout=1800)
+        with self._render_input(asset, bed_events, presentation) as input_path:
+            command = [
+                *prefix,
+                str(input_path),
+                str(temporary),
+                layout.cavern_spec or layout.name,
+                "--raw",
+            ]
+            if options.max_seconds > 0.0:
+                command += ["--max-seconds", f"{options.max_seconds:.6f}"]
+            if options.gain_db:
+                command += ["--gain-db", f"{options.gain_db:.6f}"]
+            command += ["--update-rate", str(options.update_rate)]
+            run_command(command, timeout=1800)
 
         if not temporary.is_file() or not sidecar.is_file():
             raise RuntimeError(f"Cavern produced no output: {temporary}")
@@ -92,6 +187,7 @@ class CavernBackend(RenderBackend):
                 "labels": list(layout.labels),
                 "options": options.to_dict(),
                 "command": command,
+                "bed_events_added": sorted(bed_events),
             }
         )
         write_meta(meta_path, meta)
